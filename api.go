@@ -242,12 +242,14 @@ func (api *API) GetAuditLog() []AuditEntry {
 
 // API represents the HTTP API server
 type API struct {
-	db          *PersistentDatabase
-	server      *http.Server
-	security    *SecurityConfig
-	rateLimiter *RateLimiter
-	auditLog    []AuditEntry
-	auditMu     sync.RWMutex
+	db           *PersistentDatabase
+	server       *http.Server
+	security     *SecurityConfig
+	rateLimiter  *RateLimiter
+	auditLog     []AuditEntry
+	auditMu      sync.RWMutex
+	reloadTicker *time.Ticker
+	reloadDone   chan struct{}
 }
 
 // AuditEntry represents an audit log entry
@@ -267,6 +269,7 @@ func NewSecureAPI(db *PersistentDatabase, port int, security *SecurityConfig) *A
 		security:    security,
 		rateLimiter: NewRateLimiter(),
 		auditLog:    make([]AuditEntry, 0, 1000),
+		reloadDone:  make(chan struct{}),
 	}
 
 	mux := http.NewServeMux()
@@ -279,6 +282,7 @@ func NewSecureAPI(db *PersistentDatabase, port int, security *SecurityConfig) *A
 	mux.HandleFunc("/decrement", api.securityMiddleware(api.handleDecrement))
 	mux.HandleFunc("/pattern", api.securityMiddleware(api.handlePatternQuery))
 	mux.HandleFunc("/series", api.securityMiddleware(api.handleListSeries))
+	mux.HandleFunc("/reload", api.securityMiddleware(api.handleReload))
 	mux.HandleFunc("/health", api.securityMiddleware(api.handleHealth))
 	mux.HandleFunc("/audit", api.securityMiddleware(api.handleAuditLog))
 
@@ -302,6 +306,23 @@ func NewAPI(db *PersistentDatabase, port int) *API {
 
 // Start starts the API server
 func (api *API) Start() error {
+	// Start periodic reload
+	api.reloadTicker = time.NewTicker(10 * time.Second) // Reload every 10 seconds
+	go func() {
+		for {
+			select {
+			case <-api.reloadTicker.C:
+				if err := api.db.Reload(); err != nil {
+					log.Printf("Periodic reload error: %v", err)
+				} else {
+					log.Printf("Periodic reload completed")
+				}
+			case <-api.reloadDone:
+				return
+			}
+		}
+	}()
+
 	if api.security != nil && api.security.EnableTLS {
 		return api.server.ListenAndServeTLS(
 			api.security.TLSCertFile,
@@ -313,6 +334,10 @@ func (api *API) Start() error {
 
 // Stop stops the API server
 func (api *API) Stop() error {
+	if api.reloadTicker != nil {
+		api.reloadTicker.Stop()
+		close(api.reloadDone)
+	}
 	return api.server.Close()
 }
 
@@ -625,6 +650,24 @@ func (api *API) handleAuditLog(w http.ResponseWriter, r *http.Request) {
 	auditLog := api.GetAuditLog()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(auditLog)
+}
+
+// handleReload handles POST /reload
+func (api *API) handleReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := api.db.Reload(); err != nil {
+		log.Printf("Reload error: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Database reloaded from WAL")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "OK")
 }
 
 // handleHealth handles GET /health

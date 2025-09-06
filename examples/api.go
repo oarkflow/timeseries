@@ -25,7 +25,6 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-
 	// Debug: List series after loading
 	series := db.ListSeries()
 	log.Printf("Loaded %d series from database: %v", len(series), series)

@@ -53,6 +53,7 @@ func NewPersistentDatabase(dataDir string) (*PersistentDatabase, error) {
 		return nil, err
 	}
 	pdb.walFile = walFile
+	fmt.Printf("Opened WAL file: %s\n", walPath)
 
 	// Start async writer
 	go pdb.asyncWriter()
@@ -73,11 +74,12 @@ func (pdb *PersistentDatabase) Insert(seriesName string, timestamp time.Time, va
 	}
 
 	// Then, write to WAL
-	return pdb.writeToWAL(seriesName, timestamp, value, false)
+	return pdb.writeToWAL(seriesName, timestamp, value, true)
 }
 
 // Increment persists the increment operation
 func (pdb *PersistentDatabase) Increment(seriesName string) (float64, error) {
+	fmt.Printf("Increment: series=%s\n", seriesName)
 	// First, increment in memory
 	currentValue, err := pdb.Database.Increment(seriesName)
 	if err != nil {
@@ -90,7 +92,8 @@ func (pdb *PersistentDatabase) Increment(seriesName string) (float64, error) {
 	lastPoint := series.Points[len(series.Points)-1]
 	series.mu.RUnlock()
 
-	err = pdb.writeToWAL(seriesName, time.Unix(0, lastPoint.Timestamp), lastPoint.Value, false)
+	fmt.Printf("Increment: writing to WAL series=%s, ts=%d, value=%f\n", seriesName, lastPoint.Timestamp, lastPoint.Value)
+	err = pdb.writeToWAL(seriesName, time.Unix(0, lastPoint.Timestamp), lastPoint.Value, true)
 	return currentValue, err
 }
 
@@ -108,7 +111,7 @@ func (pdb *PersistentDatabase) Decrement(seriesName string) (float64, error) {
 	lastPoint := series.Points[len(series.Points)-1]
 	series.mu.RUnlock()
 
-	err = pdb.writeToWAL(seriesName, time.Unix(0, lastPoint.Timestamp), lastPoint.Value, false)
+	err = pdb.writeToWAL(seriesName, time.Unix(0, lastPoint.Timestamp), lastPoint.Value, true)
 	return currentValue, err
 }
 
@@ -123,6 +126,7 @@ func (pdb *PersistentDatabase) InsertSync(seriesName string, timestamp time.Time
 // writeToWAL writes the insertion to the WAL. If syncNow is true the write is
 // performed synchronously (file write + Sync) to guarantee durability.
 func (pdb *PersistentDatabase) writeToWAL(seriesName string, timestamp time.Time, value float64, syncNow bool) error {
+	fmt.Printf("writeToWAL: series=%s, ts=%d, value=%f, sync=%v\n", seriesName, timestamp.UnixNano(), value, syncNow)
 	// Format: seriesNameLen (4 bytes) | seriesName | timestamp (8 bytes) | value (8 bytes)
 	seriesNameBytes := []byte(seriesName)
 	seriesNameLen := uint32(len(seriesNameBytes))
@@ -142,11 +146,15 @@ func (pdb *PersistentDatabase) writeToWAL(seriesName string, timestamp time.Time
 
 	if syncNow {
 		// perform synchronous write and sync immediately
-		if _, err := pdb.walFile.Write(buf); err != nil {
+		n, err := pdb.walFile.Write(buf)
+		if err != nil {
+			fmt.Printf("writeToWAL: write error: %v\n", err)
 			bufferPool.Put(buf[:0])
 			return err
 		}
+		fmt.Printf("writeToWAL: wrote %d bytes\n", n)
 		if err := pdb.walFile.Sync(); err != nil {
+			fmt.Printf("writeToWAL: sync error: %v\n", err)
 			bufferPool.Put(buf[:0])
 			return err
 		}
@@ -209,19 +217,31 @@ func (pdb *PersistentDatabase) loadFromDisk() error {
 			value := math.Float64frombits(valueBits)
 			pos += 16
 
+			// Skip invalid series names
+			if !isValidSeriesName(seriesName) {
+				continue
+			}
 			// Insert into memory
 			ts := time.Unix(0, timestamp)
 			pdb.Database.Insert(seriesName, ts, value)
 			loadedPoints++
-			if loadedPoints <= 5 { // Log first 5
-				fmt.Printf("Loaded point: series=%s, ts=%d, value=%f\n", seriesName, timestamp, value)
-			}
+			fmt.Printf("Loaded point: series=%s, ts=%d, value=%f\n", seriesName, timestamp, value)
 		}
 		offset += int64(pos)
 	}
 	fmt.Printf("Loaded %d points from WAL\n", loadedPoints)
 
 	return nil
+}
+
+// Reload reloads data from WAL, clearing existing in-memory data
+func (pdb *PersistentDatabase) Reload() error {
+	pdb.mu.Lock()
+	// Clear existing series
+	pdb.series = make(map[string]*Series)
+	pdb.mu.Unlock()
+
+	return pdb.loadFromDisk()
 }
 
 // Close closes the database and WAL file

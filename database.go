@@ -206,12 +206,28 @@ func (db *Database) ListSeries() []string {
 
 	names := make([]string, 0, len(db.series))
 	for name := range db.series {
-		names = append(names, name)
+		// Filter out series names with non-printable characters (likely corrupted data)
+		if isValidSeriesName(name) {
+			names = append(names, name)
+		}
 	}
 	// Return a deterministic ordering to avoid surprising callers
 	// (map iteration order is intentionally randomized by Go).
 	sort.Strings(names)
 	return names
+}
+
+// isValidSeriesName checks if a series name contains only printable characters and is not empty
+func isValidSeriesName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if r < 32 || r > 126 { // ASCII printable range
+			return false
+		}
+	}
+	return true
 }
 
 // DeleteSeries removes a series from the database
